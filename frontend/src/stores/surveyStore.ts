@@ -5,7 +5,7 @@
  */
 import { create } from 'zustand';
 import type { RateLevel, Survey } from '../types/survey';
-import { db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
+import { db, hasSuspendedInterpretation, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
 import type { SurvivalSummary } from '../hooks/useSurvivalRate';
 import { nowIso, uuid } from '../utils/id';
 import { calcSurvivalRate, rateLevel } from '../utils/rate';
@@ -141,6 +141,9 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
     const summary = get().summaryOf(plotId);
     const plot = usePlotStore.getState().plots.find((row) => row.id === plotId);
     if (!plot) return '地块不存在，无法生成补植计划';
+    // 挂起期间不生成补植计划：判读与实测差异超阈值、正在等复核的地块先挂起
+    const suspended = await hasSuspendedInterpretation(plotId);
+    if (suspended) return '该地块有判读记录挂起等复核，挂起期间不生成补植计划';
     const missing = summary.suggestReplant;
     if (missing <= 0) return '该地块当前无缺株，无需生成补植计划';
     const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';

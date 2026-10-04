@@ -9,6 +9,7 @@ import {
   advanceReplantState,
   db,
   exportSnapshot,
+  hasSuspendedInterpretation,
   importSnapshot,
   initDatabase,
   putReplant,
@@ -104,6 +105,9 @@ export const useReplantStore = create<ReplantStoreState>((set, get) => ({
   },
 
   async createReplant(draft) {
+    // 挂起期间不生成补植计划
+    const suspended = await hasSuspendedInterpretation(draft.plotId);
+    if (suspended) throw new Error('该地块有判读记录挂起等复核，挂起期间不生成补植计划');
     const stamp = nowIso();
     const row: Replant = {
       id: uuid('replant'),

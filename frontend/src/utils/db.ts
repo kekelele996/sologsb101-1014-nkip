@@ -11,15 +11,17 @@ import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant, ReplantState } from '../types/replant';
-import { rateLevel } from './rate';
-import { nowIso, today } from './id';
+import type { Interpretation } from '../types/interpretation';
+import { rateLevel, calcSurvivalRate } from './rate';
+import { nowIso, today, uuid } from './id';
+import { buildInterpretationRow, reconcileInterpretation, UPGRADE_PACKAGE_ID } from './reconcile';
 import { seedDatabase } from './seed';
 
 /** 数据库名 */
 export const DB_NAME = 'gbmangrove';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
 export const ROW_REVISION = 2;
@@ -30,6 +32,7 @@ class MangroveDatabase extends Dexie {
   plantings!: Table<Planting, string>;
   surveys!: Table<Survey, string>;
   replants!: Table<Replant, string>;
+  interpretations!: Table<Interpretation, string>;
 
   constructor() {
     super(DB_NAME);
@@ -44,7 +47,7 @@ class MangroveDatabase extends Dexie {
     });
 
     // ---------- v2：补齐索引与回写字段，并迁移历史数据 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         plots: 'id, name, tideZone, substrate, restoreMode, state, createdAt, updatedAt',
         seedlings: 'id, plotId, species, source, arrivalDate, quantity',
@@ -80,6 +83,37 @@ class MangroveDatabase extends Dexie {
           if (typeof row.grade !== 'string') row.grade = rateLevel(rate);
           if (typeof row.gradeManual !== 'boolean') row.gradeManual = false;
         });
+      });
+
+    // ---------- v3：新增航测判读表，已有验收按架次补齐判读来源 ----------
+    this.version(3)
+      .stores({
+        interpretations: 'id, plotId, [plotId+round], packageId, status, sortieNo',
+      })
+      .upgrade(async (tx) => {
+        // 已有数据没有判读来源：升级时按测次（架次）补齐一条判读记录，来源标为「升级补录」
+        const surveys = await tx.table('surveys').toArray();
+        const stamp = nowIso();
+        const rows = (surveys as Survey[]).map((row) => ({
+          id: uuid('interp'),
+          plotId: row.plotId,
+          round: row.round,
+          sortieNo: `升级补录·架次${row.round}`,
+          packageId: UPGRADE_PACKAGE_ID,
+          source: '升级补录',
+          interpretedRate: row.survivalRate,
+          interpretedAliveCount: row.aliveCount,
+          avgHeightCm: row.avgHeightCm,
+          interpretedDate: row.date,
+          status: 'normal' as const,
+          suspendReason: '',
+          backfilled: false,
+          reconciledAt: stamp,
+          createdAt: stamp,
+          updatedAt: stamp,
+          revision: ROW_REVISION,
+        }));
+        if (rows.length > 0) await tx.table('interpretations').bulkPut(rows);
       });
   }
 }
@@ -126,13 +160,14 @@ export async function patchPlot(id: string, patch: Partial<Plot>): Promise<void>
   await db.plots.update(id, { ...patch, updatedAt: nowIso() });
 }
 
-/** 删除地块并级联清理其下苗木批次、栽植、验收与补植计划 */
+/** 删除地块并级联清理其下苗木批次、栽植、验收、补植计划与航测判读 */
 export async function removePlot(id: string): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  await db.transaction('rw', [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.interpretations], async () => {
     await db.seedlings.where('plotId').equals(id).delete();
     await db.plantings.where('plotId').equals(id).delete();
     await db.surveys.where('plotId').equals(id).delete();
     await db.replants.where('plotId').equals(id).delete();
+    await db.interpretations.where('plotId').equals(id).delete();
     await db.plots.delete(id);
   });
 }
@@ -276,6 +311,143 @@ export async function advanceReplantState(replantId: string, next: ReplantState)
   }
 }
 
+/* ------------------------------ 航测判读 ------------------------------ */
+
+export async function listInterpretations(): Promise<Interpretation[]> {
+  const rows = await db.interpretations.toArray();
+  return rows.sort((a, b) => a.plotId.localeCompare(b.plotId) || a.round - b.round);
+}
+
+export async function putInterpretation(row: Interpretation): Promise<void> {
+  await db.interpretations.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+}
+
+export async function removeInterpretation(id: string): Promise<void> {
+  await db.interpretations.delete(id);
+}
+
+/** 判读挂起复核通过：恢复为正常状态 */
+export async function resolveInterpretation(id: string): Promise<void> {
+  await db.interpretations.update(id, { status: 'normal', suspendReason: '', updatedAt: nowIso() });
+}
+
+/** 该地块是否存在挂起等复核的判读（挂起期间不生成补植计划） */
+export async function hasSuspendedInterpretation(plotId: string): Promise<boolean> {
+  const count = await db.interpretations
+    .where('plotId')
+    .equals(plotId)
+    .filter((row) => row.status === 'suspended')
+    .count();
+  return count > 0;
+}
+
+export interface InterpretationImportResult {
+  /** 实际写入的判读条数 */
+  imported: number;
+  /** 因判读包重复而跳过的条数 */
+  duplicated: number;
+  /** 由判读回填的测次数（此前无实测记录） */
+  backfilled: number;
+  /** 挂起等复核的条数 */
+  suspended: number;
+}
+
+/**
+ * 导入航测判读包（事务性：失败则整包回滚，现场测次照旧）。
+ * - 同一个判读包（packageId）重复交回来只留一份：已存在则整包跳过
+ * - 判读只回填还没实测的测次；已定级测次不被判读值顶掉
+ * - 回填的测次按判读值派生成活率与等级
+ */
+export async function importInterpretationPackage(
+  pkg: InterpretationPackageLike,
+): Promise<InterpretationImportResult> {
+  const result: InterpretationImportResult = { imported: 0, duplicated: 0, backfilled: 0, suspended: 0 };
+  await db.transaction('rw', db.interpretations, db.surveys, db.plantings, db.plots, async () => {
+    const [existingInterps, existingSurveys, plantings, plots] = await Promise.all([
+      db.interpretations.toArray(),
+      db.surveys.toArray(),
+      db.plantings.toArray(),
+      db.plots.toArray(),
+    ]);
+
+    // 同一个判读包只留一份：已存在同 packageId 则整包跳过
+    if (existingInterps.some((row) => row.packageId === pkg.packageId)) {
+      result.duplicated = pkg.items.length;
+      return;
+    }
+
+    const plotIds = new Set(plots.map((row) => row.id));
+    const totalByPlot = new Map<string, number>();
+    for (const row of plantings) {
+      totalByPlot.set(row.plotId, (totalByPlot.get(row.plotId) ?? 0) + row.count);
+    }
+    const surveyByPlotRound = new Map<string, Survey>();
+    for (const row of existingSurveys) {
+      surveyByPlotRound.set(`${row.plotId}__${row.round}`, row);
+    }
+
+    const interpRows: Interpretation[] = [];
+    const newSurveys: Survey[] = [];
+    for (const item of pkg.items) {
+      if (!plotIds.has(item.plotId)) {
+        throw new Error(`判读条目引用了不存在的地块：${item.plotId}`);
+      }
+      const key = `${item.plotId}__${item.round}`;
+      const existingSurvey = surveyByPlotRound.get(key) ?? null;
+      const row = buildInterpretationRow(item, pkg);
+      const total = totalByPlot.get(item.plotId) ?? 0;
+      const reconcile = reconcileInterpretation(row, existingSurvey, total);
+      row.status = reconcile.status;
+      row.suspendReason = reconcile.suspendReason;
+      row.backfilled = existingSurvey === null;
+      if (reconcile.status === 'suspended') result.suspended += 1;
+
+      if (existingSurvey === null) {
+        // 还没实测：判读回填该测次（已定级测次 existingSurvey 非空，不会走到这里）
+        const aliveCount = row.interpretedAliveCount ?? Math.round((total * row.interpretedRate) / 100);
+        const survivalRate = calcSurvivalRate(aliveCount, total);
+        newSurveys.push({
+          id: uuid('survey'),
+          plotId: row.plotId,
+          round: row.round,
+          date: row.interpretedDate,
+          aliveCount,
+          avgHeightCm: row.avgHeightCm ?? 0,
+          survivalRate,
+          grade: rateLevel(survivalRate),
+          gradeManual: false,
+          createdAt: row.createdAt,
+          updatedAt: row.createdAt,
+          revision: ROW_REVISION,
+        });
+        result.backfilled += 1;
+      }
+      interpRows.push(row);
+      result.imported += 1;
+    }
+
+    if (interpRows.length > 0) await db.interpretations.bulkPut(interpRows);
+    if (newSurveys.length > 0) await db.surveys.bulkPut(newSurveys);
+  });
+  return result;
+}
+
+/** 判读包入参（结构与 InterpretationPackage 一致，避免循环依赖在此处用结构类型） */
+export interface InterpretationPackageLike {
+  packageId: string;
+  source?: string;
+  flownAt?: string;
+  items: Array<{
+    plotId: string;
+    round: number;
+    sortieNo?: string;
+    interpretedRate: number;
+    interpretedAliveCount?: number | null;
+    avgHeightCm?: number | null;
+    interpretedDate?: string;
+  }>;
+}
+
 /* ---------------------------- 整库快照 ---------------------------- */
 
 export interface DatabaseSnapshot {
@@ -287,16 +459,18 @@ export interface DatabaseSnapshot {
   plantings: Planting[];
   surveys: Survey[];
   replants: Replant[];
+  interpretations: Interpretation[];
 }
 
 /** 导出整库快照 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, plantings, surveys, replants, interpretations] = await Promise.all([
     db.plots.toArray(),
     db.seedlings.toArray(),
     db.plantings.toArray(),
     db.surveys.toArray(),
     db.replants.toArray(),
+    db.interpretations.toArray(),
   ]);
   return {
     name: DB_NAME,
@@ -307,36 +481,40 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     plantings,
     surveys,
     replants,
+    interpretations,
   };
 }
 
 /** 用快照覆盖整库（导入存档） */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  await db.transaction('rw', [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.interpretations], async () => {
     await Promise.all([
       db.plots.clear(),
       db.seedlings.clear(),
       db.plantings.clear(),
       db.surveys.clear(),
       db.replants.clear(),
+      db.interpretations.clear(),
     ]);
     await db.plots.bulkPut(snapshot.plots.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.seedlings.bulkPut(snapshot.seedlings.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.plantings.bulkPut(snapshot.plantings.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.surveys.bulkPut(snapshot.surveys.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.replants.bulkPut(snapshot.replants.map((row) => ({ ...row, revision: ROW_REVISION })));
+    await db.interpretations.bulkPut(snapshot.interpretations.map((row) => ({ ...row, revision: ROW_REVISION })));
   });
 }
 
 /** 清空全部数据并重新灌入演示数据 */
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
+  await db.transaction('rw', [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.interpretations], async () => {
     await Promise.all([
       db.plots.clear(),
       db.seedlings.clear(),
       db.plantings.clear(),
       db.surveys.clear(),
       db.replants.clear(),
+      db.interpretations.clear(),
     ]);
   });
   await seedDatabase();
@@ -344,12 +522,13 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [plots, seedlings, plantings, surveys, replants] = await Promise.all([
+  const [plots, seedlings, plantings, surveys, replants, interpretations] = await Promise.all([
     db.plots.count(),
     db.seedlings.count(),
     db.plantings.count(),
     db.surveys.count(),
     db.replants.count(),
+    db.interpretations.count(),
   ]);
-  return { plots, seedlings, plantings, surveys, replants };
+  return { plots, seedlings, plantings, surveys, replants, interpretations };
 }
