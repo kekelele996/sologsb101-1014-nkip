@@ -49,6 +49,16 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* 航测判读回填的测次：青色底，提示尚未现场实测 */
+.survey-row-aerial > td {
+  background: rgba(19, 194, 194, 0.06) !important;
+}
+
+/* 判读与现场差异过大挂起的条目：浅红底，等待复核 */
+.aerial-row-suspended > td {
+  background: rgba(192, 57, 43, 0.06) !important;
+}
+
 @media (max-width: 900px) {
   .ant-layout-content {
     padding: 12px !important;

@@ -221,6 +221,8 @@ export default function PlotList() {
                 {stat.trend > 0 ? <RiseOutlined /> : <FallOutlined />} {Math.abs(stat.trend)}
               </Typography.Text>
             ) : null}
+            {stat.aerialSuspended ? <Tag color="error">判读挂起</Tag> : null}
+            {!stat.aerialSuspended && stat.aerialBackfillCount > 0 ? <Tag color="cyan">航测回填 {stat.aerialBackfillCount}</Tag> : null}
           </Space>
         );
       },

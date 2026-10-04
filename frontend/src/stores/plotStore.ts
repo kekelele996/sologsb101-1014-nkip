@@ -9,6 +9,7 @@ import type { Plot, PlotDraft, Substrate, TideZone } from '../types/plot';
 import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey, RateLevel } from '../types/survey';
+import type { AerialItem } from '../types/aerial';
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
@@ -47,6 +48,10 @@ export interface PlotStat {
   trend: number;
   /** 建议补植株数 */
   suggestReplant: number;
+  /** 是否有航测判读条目挂起等复核（挂起期间不生成补植计划） */
+  aerialSuspended: boolean;
+  /** 航测判读回填（尚无现场实测）的测次数 */
+  aerialBackfillCount: number;
 }
 
 const EMPTY_FILTERS: PlotFilters = { keyword: '', tideZone: 'all', substrate: 'all' };
@@ -74,6 +79,7 @@ interface PlotStoreState {
   seedlings: Seedling[];
   plantings: Planting[];
   surveys: Survey[];
+  aerialItems: AerialItem[];
   currentPlotId: string | null;
   loading: boolean;
   ready: boolean;
@@ -105,6 +111,8 @@ const EMPTY_STAT: Omit<PlotStat, 'plotId'> = {
   level: 'poor',
   trend: 0,
   suggestReplant: 0,
+  aerialSuspended: false,
+  aerialBackfillCount: 0,
 };
 
 let subscribed = false;
@@ -114,6 +122,7 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
   seedlings: [],
   plantings: [],
   surveys: [],
+  aerialItems: [],
   currentPlotId: readCurrentPlotId(),
   loading: true,
   ready: false,
@@ -130,19 +139,21 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
       if (!subscribed) {
         subscribed = true;
         liveQuery(async () => {
-          const [plots, seedlings, plantings, surveys] = await Promise.all([
+          const [plots, seedlings, plantings, surveys, aerialItems] = await Promise.all([
             db.plots.toArray(),
             db.seedlings.toArray(),
             db.plantings.toArray(),
             db.surveys.toArray(),
+            db.aerialItems.toArray(),
           ]);
-          return { plots, seedlings, plantings, surveys };
+          return { plots, seedlings, plantings, surveys, aerialItems };
         }).subscribe({
-          next: ({ plots, seedlings, plantings, surveys }) => {
+          next: ({ plots, seedlings, plantings, surveys, aerialItems }) => {
             const stats: Record<string, PlotStat> = {};
             const summaries: Record<string, SurvivalSummary> = {};
             plots.forEach((plot) => {
               const plotSeedlings = seedlings.filter((row) => row.plotId === plot.id);
+              const plotAerialItems = aerialItems.filter((row) => row.plotId === plot.id);
               const summary = buildSurvivalSummary(plot.id, surveys, plantings);
               summaries[plot.id] = summary;
               stats[plot.id] = {
@@ -155,6 +166,8 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
                 level: summary.level,
                 trend: summary.trend,
                 suggestReplant: summary.suggestReplant,
+                aerialSuspended: plotAerialItems.some((row) => row.status === 'suspended'),
+                aerialBackfillCount: plotAerialItems.filter((row) => row.status === 'backfilled').length,
               };
             });
             const sorted = [...plots].sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN'));
@@ -165,6 +178,7 @@ export const usePlotStore = create<PlotStoreState>((set, get) => ({
               seedlings,
               plantings,
               surveys,
+              aerialItems,
               stats,
               summaries,
               loading: false,

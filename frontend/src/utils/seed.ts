@@ -9,6 +9,7 @@ import type { Seedling } from '../types/seedling';
 import type { Planting } from '../types/planting';
 import type { Survey } from '../types/survey';
 import type { Replant } from '../types/replant';
+import type { AerialItem, AerialPackage } from '../types/aerial';
 import { calcSurvivalRate, rateLevel } from './rate';
 
 const SEED_TIME = '2025-01-06T02:00:00.000Z';
@@ -32,17 +33,27 @@ function plantingRow(row: Omit<Planting, 'createdAt' | 'updatedAt' | 'revision'>
   return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
-function surveyRow(row: Omit<Survey, 'createdAt' | 'updatedAt' | 'revision' | 'grade' | 'gradeManual' | 'survivalRate'>, total: number): Survey {
+function surveyRow(row: Omit<Survey, 'createdAt' | 'updatedAt' | 'revision' | 'grade' | 'gradeManual' | 'survivalRate' | 'source' | 'aerialItemId'>, total: number): Survey {
   const survivalRate = calcSurvivalRate(row.aliveCount, total);
   return {
     ...row,
     survivalRate,
     grade: rateLevel(survivalRate),
     gradeManual: false,
+    source: 'field',
+    aerialItemId: '',
     createdAt: SEED_TIME,
     updatedAt: SEED_TIME,
     revision: ROW_REVISION,
   };
+}
+
+function aerialPackageRow(row: Omit<AerialPackage, 'createdAt' | 'updatedAt' | 'revision'>): AerialPackage {
+  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
+}
+
+function aerialItemRow(row: Omit<AerialItem, 'createdAt' | 'updatedAt' | 'revision'>): AerialItem {
+  return { ...row, createdAt: SEED_TIME, updatedAt: SEED_TIME, revision: ROW_REVISION };
 }
 
 function replantRow(row: Omit<Replant, 'createdAt' | 'updatedAt' | 'revision'>): Replant {
@@ -121,7 +132,7 @@ export async function seedDatabase(): Promise<void> {
     [SEED_IDS.plotC]: 8000,
   };
 
-  // ---------------- 验收记录（每地块 2–3 个测次） ----------------
+  // ---------------- 验收记录（每地块 2–3 个现场测次） ----------------
   const surveys: Survey[] = [
     surveyRow({ id: 'survey-a1', plotId: SEED_IDS.plotA, round: 1, date: '2024-06-20', aliveCount: 4680, avgHeightCm: 62 }, totalByPlot[SEED_IDS.plotA]),
     surveyRow({ id: 'survey-a2', plotId: SEED_IDS.plotA, round: 2, date: '2024-09-18', aliveCount: 4420, avgHeightCm: 78 }, totalByPlot[SEED_IDS.plotA]),
@@ -132,6 +143,26 @@ export async function seedDatabase(): Promise<void> {
     surveyRow({ id: 'survey-c2', plotId: SEED_IDS.plotC, round: 2, date: '2024-08-30', aliveCount: 7440, avgHeightCm: 88 }, totalByPlot[SEED_IDS.plotC]),
   ];
 
+  // 东港 3 号第 4 测次现场还没测，由航测判读回填占位（source='aerial'）
+  const aerialBackfillRate = calcSurvivalRate(3978, totalByPlot[SEED_IDS.plotA]);
+  const surveyA4Backfill: Survey = {
+    id: 'survey-a4',
+    plotId: SEED_IDS.plotA,
+    round: 4,
+    date: '2025-03-20',
+    aliveCount: 3978,
+    avgHeightCm: 108,
+    survivalRate: aerialBackfillRate,
+    grade: rateLevel(aerialBackfillRate),
+    gradeManual: false,
+    source: 'aerial',
+    aerialItemId: 'aerial-item-a4',
+    createdAt: SEED_TIME,
+    updatedAt: SEED_TIME,
+    revision: ROW_REVISION,
+  };
+  surveys.push(surveyA4Backfill);
+
   // ---------------- 补植计划（每地块 1 条，覆盖三种状态） ----------------
   const replants: Replant[] = [
     replantRow({ id: 'replant-a1', plotId: SEED_IDS.plotA, missingCount: 1092, planDate: '2025-04-10', species: '秋茄', state: '待补植' }),
@@ -139,11 +170,85 @@ export async function seedDatabase(): Promise<void> {
     replantRow({ id: 'replant-c1', plotId: SEED_IDS.plotC, missingCount: 560, planDate: '2024-11-05', species: '无瓣海桑', state: '已复核' }),
   ];
 
-  await db.transaction('rw', db.plots, db.seedlings, db.plantings, db.surveys, db.replants, async () => {
-    await db.plots.bulkPut(plots);
-    await db.seedlings.bulkPut(seedlings);
-    await db.plantings.bulkPut(plantings);
-    await db.surveys.bulkPut(surveys);
-    await db.replants.bulkPut(replants);
-  });
+  // ---------------- 无人机航测判读包（演示回填 / 挂起 / 一致三种对账结果） ----------------
+  const aerialPackages: AerialPackage[] = [
+    aerialPackageRow({
+      id: 'aerial-pkg-2025-03',
+      packageId: 'UAV-2025-0320',
+      sortie: 'sortie-2025-0320',
+      flightDate: '2025-03-20',
+      receivedAt: '2025-03-22T03:00:00.000Z',
+      itemCount: 3,
+    }),
+  ];
+  const aerialItems: AerialItem[] = [
+    // 东港第 4 测次：现场还没测，判读回填
+    aerialItemRow({
+      id: 'aerial-item-a4',
+      packageRef: 'aerial-pkg-2025-03',
+      packageId: 'UAV-2025-0320',
+      sortie: 'sortie-2025-0320',
+      plotId: SEED_IDS.plotA,
+      round: 4,
+      survivalRate: aerialBackfillRate,
+      avgHeightCm: 108,
+      status: 'backfilled',
+      rateDiff: null,
+      heightDiff: null,
+      note: '该测次尚无现场实测，判读值已回填，待现场补测后自动对账',
+      resolveVerdict: null,
+      resolvedAt: null,
+      backfilledSurveyId: 'survey-a4',
+    }),
+    // 西湾第 2 测次：判读成活率 58% vs 现场 64%（差 6 个百分点），超阈值挂起
+    aerialItemRow({
+      id: 'aerial-item-b2',
+      packageRef: 'aerial-pkg-2025-03',
+      packageId: 'UAV-2025-0320',
+      sortie: 'sortie-2025-0320',
+      plotId: SEED_IDS.plotB,
+      round: 2,
+      survivalRate: 58,
+      avgHeightCm: 55,
+      status: 'suspended',
+      rateDiff: 6,
+      heightDiff: 0,
+      note: '待复核：成活率相差 6 个百分点（容差 5）',
+      resolveVerdict: null,
+      resolvedAt: null,
+      backfilledSurveyId: '',
+    }),
+    // 北屿第 2 测次：判读与现场基本一致
+    aerialItemRow({
+      id: 'aerial-item-c2',
+      packageRef: 'aerial-pkg-2025-03',
+      packageId: 'UAV-2025-0320',
+      sortie: 'sortie-2025-0320',
+      plotId: SEED_IDS.plotC,
+      round: 2,
+      survivalRate: 93,
+      avgHeightCm: 90,
+      status: 'matched',
+      rateDiff: 0,
+      heightDiff: 2,
+      note: '',
+      resolveVerdict: null,
+      resolvedAt: null,
+      backfilledSurveyId: '',
+    }),
+  ];
+
+  await db.transaction(
+    'rw',
+    [db.plots, db.seedlings, db.plantings, db.surveys, db.replants, db.aerialPackages, db.aerialItems],
+    async () => {
+      await db.plots.bulkPut(plots);
+      await db.seedlings.bulkPut(seedlings);
+      await db.plantings.bulkPut(plantings);
+      await db.surveys.bulkPut(surveys);
+      await db.replants.bulkPut(replants);
+      await db.aerialPackages.bulkPut(aerialPackages);
+      await db.aerialItems.bulkPut(aerialItems);
+    },
+  );
 }

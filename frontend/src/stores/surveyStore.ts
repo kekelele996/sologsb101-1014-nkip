@@ -5,11 +5,19 @@
  */
 import { create } from 'zustand';
 import type { RateLevel, Survey } from '../types/survey';
-import { db, initDatabase, patchSurveyGrades, putSurvey, removeSurvey } from '../utils/db';
+import {
+  ROW_REVISION,
+  db,
+  initDatabase,
+  patchSurveyGrades,
+  putFieldSurvey,
+  removeSurvey,
+} from '../utils/db';
 import type { SurvivalSummary } from '../hooks/useSurvivalRate';
 import { nowIso, uuid } from '../utils/id';
-import { calcSurvivalRate, rateLevel } from '../utils/rate';
+import { calcSurvivalRate } from '../utils/rate';
 import type { SurveyDraft } from '../types/survey';
+import { hasSuspendedAerial } from '../utils/reconcile';
 import { usePlotStore } from './plotStore';
 
 /** 验收筛选条件（地块 + 等级 + 关键字 + 日期区间） */
@@ -86,8 +94,8 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   async createSurvey(draft) {
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
-    const stamp = nowIso();
-    const row: Survey = {
+    // 现场补测若落在航测已回填的地块 + 测次上，会直接顶替航测占位并触发对账
+    const row = await putFieldSurvey({
       id: uuid('survey'),
       plotId: draft.plotId,
       round: draft.round,
@@ -95,13 +103,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       aliveCount: draft.aliveCount,
       avgHeightCm: draft.avgHeightCm,
       survivalRate,
-      grade: rateLevel(survivalRate),
-      gradeManual: false,
-      createdAt: stamp,
-      updatedAt: stamp,
-      revision: 2,
-    };
-    await putSurvey(row);
+    });
     set({ revision: get().revision + 1 });
     return row;
   },
@@ -111,14 +113,17 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
     if (!existing) return;
     const total = totalPlantedOf(draft.plotId);
     const survivalRate = calcSurvivalRate(draft.aliveCount, total);
-    await putSurvey({
-      ...existing,
+    await putFieldSurvey({
+      id: surveyId,
       plotId: draft.plotId,
       round: draft.round,
       date: draft.date,
       aliveCount: draft.aliveCount,
       avgHeightCm: draft.avgHeightCm,
       survivalRate,
+      // 已定级（人工复核）的记录保留现场等级，不被重算顶掉
+      grade: existing.grade,
+      gradeManual: existing.gradeManual,
     });
     set({ revision: get().revision + 1 });
   },
@@ -138,9 +143,14 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
   },
 
   async generateReplant(plotId) {
-    const summary = get().summaryOf(plotId);
     const plot = usePlotStore.getState().plots.find((row) => row.id === plotId);
     if (!plot) return '地块不存在，无法生成补植计划';
+    // 挂起期间不生成补植计划：判读与现场差异未复核清楚前，缺株口径不能采信
+    const aerialItems = await db.aerialItems.toArray();
+    if (hasSuspendedAerial(aerialItems, plotId)) {
+      return `「${plot.name}」存在挂起等复核的航测判读，复核结案后才能生成补植计划`;
+    }
+    const summary = get().summaryOf(plotId);
     const missing = summary.suggestReplant;
     if (missing <= 0) return '该地块当前无缺株，无需生成补植计划';
     const species = usePlotStore.getState().seedlings.find((row) => row.plotId === plotId)?.species ?? '秋茄';
@@ -154,7 +164,7 @@ export const useSurveyStore = create<SurveyStoreState>((set, get) => ({
       state: '待补植',
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     });
     set({ revision: get().revision + 1, lastMessage: `已为「${plot.name}」生成补植计划：缺株 ${missing} 株` });
     return `已生成补植计划：缺株 ${missing} 株`;

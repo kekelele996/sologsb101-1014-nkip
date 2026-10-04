@@ -25,9 +25,11 @@ import {
   DeleteOutlined,
   EditOutlined,
   ExperimentOutlined,
+  PauseCircleOutlined,
   PlusOutlined,
   RiseOutlined,
   FallOutlined,
+  RocketOutlined,
   ToolOutlined,
 } from '@ant-design/icons';
 import dayjs, { type Dayjs } from 'dayjs';
@@ -38,7 +40,7 @@ import { useIdbTable } from '../hooks/useIdbTable';
 import { usePlotStore } from '../stores/plotStore';
 import { useSurveyStore } from '../stores/surveyStore';
 import { db } from '../utils/db';
-import { RATE_LEVEL_LABEL, RATE_LEVEL_OPTIONS, type RateLevel, type Survey } from '../types/survey';
+import { RATE_LEVEL_LABEL, RATE_LEVEL_OPTIONS, SURVEY_SOURCE_LABEL, type RateLevel, type Survey } from '../types/survey';
 import { SURVIVAL_WARN_RATE, percentText } from '../utils/rate';
 
 interface SurveyFormValues {
@@ -70,6 +72,7 @@ export default function SurveyBoard() {
   const surveyRevision = useSurveyStore((state) => state.revision);
 
   const { rows, loading, remove } = useIdbTable<Survey>(db.surveys, { sortByUpdatedAt: false });
+  const { rows: aerialItems } = useIdbTable(db.aerialItems, { sortByUpdatedAt: false });
 
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<Survey | null>(null);
@@ -155,7 +158,13 @@ export default function SurveyBoard() {
       };
       if (editing === null) {
         const row = await createSurvey(payload);
+        const replacedBackfill =
+          rows.some((item) => item.plotId === payload.plotId && item.round === payload.round && item.source === 'aerial') ||
+          aerialItems.some((item) => item.plotId === payload.plotId && item.round === payload.round && item.status === 'backfilled');
         message.success(`已录入第 ${row.round} 测次，成活率 ${row.survivalRate}%`);
+        if (replacedBackfill) {
+          message.info('该测次原为航测判读回填，已按本次现场实测顶替并自动对账', 6);
+        }
         if (row.survivalRate < SURVIVAL_WARN_RATE) {
           message.warning(`成活率 ${row.survivalRate}% 低于告警阈值 ${SURVIVAL_WARN_RATE}%，建议生成补植计划`, 6);
         }
@@ -187,7 +196,13 @@ export default function SurveyBoard() {
       return;
     }
     const result = await generateReplant(plotId);
-    message.success(result);
+    if (result.includes('挂起')) {
+      message.warning(result, 6);
+    } else if (result.includes('无缺株') || result.includes('不存在')) {
+      message.info(result);
+    } else {
+      message.success(result);
+    }
   };
 
   const columns: ColumnsType<Survey> = [
@@ -265,38 +280,56 @@ export default function SurveyBoard() {
       },
     },
     {
-      title: '等级来源',
+      title: '数据来源',
       key: 'gradeSource',
-      width: 110,
-      render: (_value, record) =>
-        record.gradeManual ? <Tag color="purple">人工复核</Tag> : <Tag>自动判定</Tag>,
+      width: 120,
+      render: (_value, record) => {
+        if (record.source === 'aerial') {
+          return (
+            <Space direction="vertical" size={0}>
+              <Tag color="cyan" icon={<RocketOutlined />}>
+                {SURVEY_SOURCE_LABEL.aerial}
+              </Tag>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                待现场补测
+              </Typography.Text>
+            </Space>
+          );
+        }
+        return record.gradeManual ? <Tag color="purple">现场 · 人工定级</Tag> : <Tag color="green">{SURVEY_SOURCE_LABEL.field}</Tag>;
+      },
     },
     {
       title: '操作',
       key: 'action',
       width: 150,
-      render: (_value, record) => (
-        <Space size={4}>
-          <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
-            编辑
-          </Button>
-          <Popconfirm
-            title="确认删除该测次记录？"
-            okText="删除"
-            okButtonProps={{ danger: true }}
-            cancelText="取消"
-            onConfirm={async () => {
-              await deleteSurvey(record.id);
-              await remove(record.id);
-              message.success('验收记录已删除');
-            }}
-          >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />}>
-              删除
+      render: (_value, record) =>
+        record.source === 'aerial' ? (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            判读占位，现场补测时录入
+          </Typography.Text>
+        ) : (
+          <Space size={4}>
+            <Button size="small" type="link" icon={<EditOutlined />} onClick={() => openEdit(record)}>
+              编辑
             </Button>
-          </Popconfirm>
-        </Space>
-      ),
+            <Popconfirm
+              title="确认删除该测次记录？"
+              okText="删除"
+              okButtonProps={{ danger: true }}
+              cancelText="取消"
+              onConfirm={async () => {
+                await deleteSurvey(record.id);
+                await remove(record.id);
+                message.success('验收记录已删除');
+              }}
+            >
+              <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+                删除
+              </Button>
+            </Popconfirm>
+          </Space>
+        ),
     },
   ];
 
@@ -304,6 +337,14 @@ export default function SurveyBoard() {
     const stat = statOf(plot.id);
     return stat.surveyCount > 0 && stat.latestRate < SURVIVAL_WARN_RATE;
   });
+
+  // 存在挂起判读条目的地块：挂起期间不生成补植计划
+  const suspendedPlotIds = new Set(
+    aerialItems.filter((item) => item.status === 'suspended').map((item) => item.plotId),
+  );
+  const suspendedPlots = plots.filter((plot) => suspendedPlotIds.has(plot.id));
+
+  const backfilledCount = rows.filter((row) => row.source === 'aerial').length;
 
   return (
     <div>
@@ -343,6 +384,27 @@ export default function SurveyBoard() {
               ))}
             </Space>
           }
+        />
+      ) : null}
+
+      {suspendedPlots.length > 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          icon={<PauseCircleOutlined />}
+          style={{ marginBottom: 14 }}
+          message={`有 ${suspendedPlots.length} 个地块的航测判读与现场实测差异过大，测次已挂起等复核`}
+          description="挂起期间不生成补植计划；请到「航测判读对账」页复核结案后再生成。"
+        />
+      ) : null}
+
+      {backfilledCount > 0 ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 14 }}
+          message={`有 ${backfilledCount} 个测次目前只有航测判读回填值（标签为「航测判读」）`}
+          description="判读只回填还没现场实测的测次；现场补测录入同一地块 + 测次后会自动顶替判读占位并对账，已定级的现场测次不会被判读值顶掉。"
         />
       ) : null}
 
@@ -436,10 +498,12 @@ export default function SurveyBoard() {
             loading={loading || !ready}
             columns={columns}
             dataSource={filtered}
-            scroll={{ x: 1280 }}
+            scroll={{ x: 1380 }}
+            rowClassName={(record) => (record.source === 'aerial' ? 'survey-row-aerial' : '')}
             rowSelection={{
               selectedRowKeys: selectedIds,
               onChange: (keys) => setSelectedIds(keys.map((key) => String(key))),
+              getCheckboxProps: (record) => ({ disabled: record.source === 'aerial' }),
             }}
             pagination={{ pageSize: 8, showSizeChanger: false }}
             locale={{
@@ -492,6 +556,7 @@ export default function SurveyBoard() {
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             成活率 = 成活株数 / 该地块栽植总株数，保存时自动计算；成活率低于 {SURVIVAL_WARN_RATE}% 会给出告警提示。
+            若该地块 + 测次只有航测判读回填值，本次现场录入会直接顶替判读占位并自动对账。
           </Typography.Text>
         </Form>
       </Modal>

@@ -10,12 +10,14 @@ import {
   BarChartOutlined,
   DashboardOutlined,
   ExperimentOutlined,
+  RocketOutlined,
   ToolOutlined,
 } from '@ant-design/icons';
 import { ROUTES } from './router';
 import { usePlotStore } from './stores/plotStore';
 import { useReplantStore } from './stores/replantStore';
 import { useSurveyStore } from './stores/surveyStore';
+import { useAerialStore } from './stores/aerialStore';
 import { percentText } from './utils/rate';
 
 const { Header, Sider, Content, Footer } = Layout;
@@ -24,6 +26,7 @@ const { Header, Sider, Content, Footer } = Layout;
 function selectedKey(pathname: string): string {
   if (pathname.startsWith('/plots/')) return ROUTES.plots;
   if (pathname.startsWith('/surveys')) return ROUTES.surveys;
+  if (pathname.startsWith('/aerial')) return ROUTES.aerial;
   if (pathname.startsWith('/replants')) return ROUTES.replants;
   return ROUTES.plots;
 }
@@ -38,13 +41,15 @@ export default function App() {
   const error = usePlotStore((state) => state.error);
   const loadAll = usePlotStore((state) => state.loadAll);
   const initSurvey = useSurveyStore((state) => state.init);
+  const initAerial = useAerialStore((state) => state.init);
   const initReplant = useReplantStore((state) => state.init);
 
   useEffect(() => {
     void loadAll();
     void initSurvey();
+    void initAerial();
     void initReplant();
-  }, [loadAll, initSurvey, initReplant]);
+  }, [loadAll, initSurvey, initAerial, initReplant]);
 
   const currentPlot = plots.find((plot) => plot.id === currentPlotId) ?? null;
   const currentStat = currentPlot === null ? null : statOf(currentPlot.id);
@@ -69,6 +74,7 @@ export default function App() {
           items={[
             { key: ROUTES.plots, icon: <AppstoreOutlined />, label: '修复地块台账' },
             { key: ROUTES.surveys, icon: <ExperimentOutlined />, label: '成活率验收台' },
+            { key: ROUTES.aerial, icon: <RocketOutlined />, label: '航测判读对账' },
             { key: ROUTES.replants, icon: <ToolOutlined />, label: '补植计划' },
           ]}
         />
@@ -78,6 +84,9 @@ export default function App() {
           </div>
           <div>
             <BarChartOutlined /> 栽植 {counts.plantings ?? 0} · 验收 {counts.surveys ?? 0}
+          </div>
+          <div>
+            <RocketOutlined /> 判读包 {counts.aerialPackages ?? 0} · 判读条目 {counts.aerialItems ?? 0}
           </div>
           <div>
             <ToolOutlined /> 补植 {counts.replants ?? 0} · 结构 v{String(counts.schemaVersion ?? '-')}
